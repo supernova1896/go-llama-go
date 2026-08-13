@@ -7,6 +7,91 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
+
+_TRITON_AVAILABLE = triton is not None and torch.cuda.is_available()
+
+
+if triton is not None:
+    @triton.jit
+    def _rms_norm_kernel(x_ptr, w_ptr, y_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
+        row = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offsets, mask=mask, other=0.0)
+        mean_square = tl.sum(x * x, axis=0) / n_cols
+        y = x * tl.rsqrt(mean_square + eps) * w
+        tl.store(y_ptr + row * n_cols + offsets, y, mask=mask)
+
+
+    @triton.jit
+    def _rope_kernel(
+        x_ptr, sin_ptr, cos_ptr, y_ptr, n_cols, head_dim, n_heads, seq_len,
+        BLOCK_SIZE: tl.constexpr
+    ):
+        row = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        half = head_dim // 2
+        mask = offsets < half
+        position = (row // n_heads) % seq_len
+        x0 = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=0.0)
+        x1 = tl.load(x_ptr + row * n_cols + half + offsets, mask=mask, other=0.0)
+        sin = tl.load(sin_ptr + position * half + offsets, mask=mask, other=0.0)
+        cos = tl.load(cos_ptr + position * half + offsets, mask=mask, other=0.0)
+        tl.store(y_ptr + row * n_cols + offsets, x0 * cos - x1 * sin, mask=mask)
+        tl.store(y_ptr + row * n_cols + half + offsets, x0 * sin + x1 * cos, mask=mask)
+
+
+    @triton.jit
+    def _attention_kernel(
+        q_ptr, k_ptr, v_ptr, out_ptr,
+        stride_qb, stride_qh, stride_qm, stride_qd,
+        stride_kb, stride_kh, stride_kn, stride_kd,
+        stride_vb, stride_vh, stride_vn, stride_vd,
+        n_q, n_k, n_heads_q, n_heads_k, head_dim, scale,
+        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        q_pos = pid % n_q
+        q_head = (pid // n_q) % n_heads_q
+        batch = pid // (n_q * n_heads_q)
+        kv_head = q_head // (n_heads_q // n_heads_k)
+        d = tl.arange(0, BLOCK_D)
+        q = tl.load(q_ptr + batch * stride_qb + q_head * stride_qh + q_pos * stride_qm + d * stride_qd, mask=d < head_dim, other=0.0)
+        m_i = -float("inf")
+        l_i = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for start in tl.range(0, n_k, BLOCK_N):
+            positions = start + tl.arange(0, BLOCK_N)
+            valid = (positions < n_k) & (positions <= q_pos)
+            k = tl.load(k_ptr + batch * stride_kb + kv_head * stride_kh + positions[:, None] * stride_kn + d[None, :] * stride_kd, mask=valid[:, None] & (d[None, :] < head_dim), other=0.0)
+            scores = tl.sum(q[None, :] * k, axis=1) * scale
+            scores = tl.where(valid, scores, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=0))
+            alpha = tl.exp2((m_i - m_new) * 1.4426950408889634)
+            p = tl.exp2((scores - m_new) * 1.4426950408889634)
+            v = tl.load(v_ptr + batch * stride_vb + kv_head * stride_vh + positions[:, None] * stride_vn + d[None, :] * stride_vd, mask=valid[:, None] & (d[None, :] < head_dim), other=0.0)
+            acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+            l_i = l_i * alpha + tl.sum(p, axis=0)
+            m_i = m_new
+        out = acc / l_i
+        tl.store(out_ptr + pid * head_dim + d, out, mask=d < head_dim)
+
+
+def _next_power_of_two(value):
+    return 1 << (value - 1).bit_length()
+
+
+def _can_use_triton(*tensors):
+    return _TRITON_AVAILABLE and all(t.is_cuda and t.is_contiguous() for t in tensors)
+
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -40,6 +125,14 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, input):
+        if _can_use_triton(input) and input.shape[-1] <= 4096:
+            input_2d = input.reshape(-1, input.shape[-1])
+            output = torch.empty_like(input_2d)
+            _rms_norm_kernel[(input_2d.shape[0],)](
+                input_2d, self.weight, output, input_2d.shape[1], self.eps,
+                BLOCK_SIZE=_next_power_of_two(input_2d.shape[1]),
+            )
+            return output.reshape_as(input)
         return (
             input
             * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -64,6 +157,17 @@ class MLP(nn.Module):
 
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
+    if _can_use_triton(input, sin_table, cos_table):
+        batch_size, seq_len, num_heads, head_dim = input.shape
+        input_contiguous = input.contiguous()
+        output = torch.empty_like(input_contiguous)
+        _rope_kernel[(batch_size * seq_len * num_heads,)](
+            input_contiguous, sin_table, cos_table, output,
+            head_dim, head_dim, num_heads, seq_len,
+            BLOCK_SIZE=_next_power_of_two(head_dim // 2),
+        )
+        return output
+
     sin_table = sin_table[None, :, None, :]
     cos_table = cos_table[None, :, None, :]
 
@@ -76,9 +180,28 @@ def apply_rotary_position_embedding(input, sin_table, cos_table):
 
 
 def apply_scaled_dot_product_attention(query, key, value):
-    _, num_heads_q, seq_len_q, emb_dim = query.shape
+    batch_size, num_heads_q, seq_len_q, emb_dim = query.shape
     _, num_heads_k, seq_len_k, _ = key.shape
-    _, num_heads_v, _, _ = value.shape
+    num_heads_v = value.shape[1]
+
+    if (
+        _can_use_triton(query, key, value)
+        and num_heads_q % num_heads_k == 0
+        and num_heads_q % num_heads_v == 0
+        and emb_dim <= 256
+    ):
+        output = torch.empty_like(query)
+        _attention_kernel[
+            (batch_size * num_heads_q * seq_len_q,)
+        ](
+            query, key, value, output,
+            *query.stride(), *key.stride(), *value.stride(),
+            seq_len_q, seq_len_k, num_heads_q, num_heads_k, emb_dim,
+            1 / math.sqrt(emb_dim),
+            BLOCK_N=64,
+            BLOCK_D=_next_power_of_two(emb_dim),
+        )
+        return output
 
     key = key.repeat_interleave(num_heads_q // num_heads_k, 1)
     value = value.repeat_interleave(num_heads_q // num_heads_v, 1)
@@ -91,9 +214,7 @@ def apply_scaled_dot_product_attention(query, key, value):
     attn_output = torch.matmul(query, key.permute(0, 1, 3, 2)) * scale
     attn_output = torch.where(attn_mask, attn_output, float("-inf"))
     attn_output = torch.softmax(attn_output, dim=-1)
-    attn_output = torch.matmul(attn_output, value)
-
-    return attn_output
+    return torch.matmul(attn_output, value)
 
 
 class Attention(nn.Module):
@@ -134,10 +255,11 @@ class Attention(nn.Module):
 
         query_states = apply_rotary_position_embedding(
             query_states, sin_table, cos_table
-        ).permute(0, 2, 1, 3)
+        ).permute(0, 2, 1, 3).contiguous()
         key_states = apply_rotary_position_embedding(
             key_states, sin_table, cos_table
-        ).permute(0, 2, 1, 3)
+        ).permute(0, 2, 1, 3).contiguous()
+        value_states = value_states.contiguous()
 
         attn_output = apply_scaled_dot_product_attention(
             query_states, key_states, value_states

@@ -52,6 +52,13 @@ if __name__ == "__main__":
     num_warmup_iterations = args.num_warmup_iterations
     num_profiling_iterations = args.num_profiling_iterations
 
+    if max_new_tokens < 0:
+        parser.error("--max-new-tokens must be non-negative")
+    if num_warmup_iterations < 0:
+        parser.error("--num-warmup-iterations must be non-negative")
+    if num_profiling_iterations <= 0:
+        parser.error("--num-profiling-iterations must be positive")
+
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
@@ -60,23 +67,27 @@ if __name__ == "__main__":
 
     texts = []
 
+    def synchronize_if_cuda():
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(torch.device(device))
+
     for _ in range(num_warmup_iterations):
-        outputs = model.generate(inputs.input_ids, max_new_tokens=max_new_tokens)
+        with torch.inference_mode():
+            outputs = model.generate(inputs.input_ids, max_new_tokens=max_new_tokens)
 
         texts.append(tokenizer.batch_decode(outputs, skip_special_tokens=True))
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    synchronize_if_cuda()
 
     elapsed_time = 0
 
     for _ in range(num_profiling_iterations):
         start_time = time.time()
 
-        outputs = model.generate(inputs.input_ids, max_new_tokens=max_new_tokens)
+        with torch.inference_mode():
+            outputs = model.generate(inputs.input_ids, max_new_tokens=max_new_tokens)
 
-        if device == "cuda":
-            torch.cuda.synchronize()
+        synchronize_if_cuda()
 
         end_time = time.time()
 
